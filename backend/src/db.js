@@ -1,21 +1,12 @@
-// Database connection — SQLite via better-sqlite3
-// Switch to pg (node-postgres) for Postgres in production by changing this one file.
+// Database connection — Postgres via pg (node-postgres)
+import pg from "pg";
+const { Pool } = pg;
 
-import Database from "better-sqlite3";
-import path     from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const DB_PATH = process.env.DB_PATH ||
-  path.resolve(__dirname, "../../scraper/news_pulse.db");
-
-let _db;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
 export function getDb() {
-  if (!_db) {
-    _db = new Database(DB_PATH, { readonly: true });
-    _db.pragma("journal_mode = WAL");
-  }
-  return _db;
+  return pool;
 }

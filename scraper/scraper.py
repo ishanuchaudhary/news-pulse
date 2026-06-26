@@ -1,95 +1,137 @@
 """
 News Pulse — RSS Ingestion & Full-Text Extraction
 Pulls from BBC, NPR, and Reuters; normalises to a shared schema;
-fetches full article body; deduplicates by URL; and persists to SQLite.
+fetches full article body; deduplicates by URL; persists to DB.
+
+Local dev  → SQLite  (set USE_SQLITE=true in .env)
+Production → Postgres/Neon (DATABASE_URL in environment)
 """
 
 import feedparser
 import requests
 import hashlib
 import logging
-import sqlite3
 import os
+import sqlite3
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
+from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-DB_PATH = os.getenv("DB_PATH", "news_pulse.db")
+USE_SQLITE = os.getenv("USE_SQLITE", "false").lower() == "true"
+DB_PATH    = os.getenv("DB_PATH", "news_pulse.db")
 
 FEEDS = [
-    {"name": "BBC News",    "url": "http://feeds.bbci.co.uk/news/rss.xml"},
-    {"name": "NPR",         "url": "https://feeds.npr.org/1001/rss.xml"},
-    {"name": "Reuters",     "url": "https://feeds.reuters.com/reuters/topNews"},
+    {"name": "BBC News", "url": "http://feeds.bbci.co.uk/news/rss.xml"},
+    {"name": "NPR",      "url": "https://feeds.npr.org/1001/rss.xml"},
+    {"name": "Reuters",  "url": "https://feeds.reuters.com/reuters/topNews"},
 ]
 
-HEADERS = {"User-Agent": "NewsPulse/1.0 (+https://github.com/ishanuchaudhary/news-pulse)"}
+HEADERS = {"User-Agent": "NewsPulse/1.0"}
 
-
-# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if USE_SQLITE:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    else:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        return psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
 
 
 def init_db():
     conn = get_connection()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id          TEXT PRIMARY KEY,
-            url         TEXT UNIQUE NOT NULL,
-            title       TEXT,
-            summary     TEXT,
-            body        TEXT,
-            source      TEXT,
-            published   TEXT,
-            fetched_at  TEXT
-        );
+    cur  = conn.cursor()
 
-        CREATE TABLE IF NOT EXISTS clusters (
-            id          TEXT PRIMARY KEY,
-            label       TEXT,
-            created_at  TEXT
-        );
+    if USE_SQLITE:
+        cur.executescript("""
+            CREATE TABLE IF NOT EXISTS articles (
+                id         TEXT PRIMARY KEY,
+                url        TEXT UNIQUE NOT NULL,
+                title      TEXT,
+                summary    TEXT,
+                body       TEXT,
+                source     TEXT,
+                published  TEXT,
+                fetched_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS clusters (
+                id         TEXT PRIMARY KEY,
+                label      TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cluster_articles (
+                cluster_id  TEXT,
+                article_id  TEXT,
+                PRIMARY KEY (cluster_id, article_id)
+            );
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS articles (
+                id          TEXT PRIMARY KEY,
+                url         TEXT UNIQUE NOT NULL,
+                title       TEXT,
+                summary     TEXT,
+                body        TEXT,
+                source      TEXT,
+                published   TEXT,
+                fetched_at  TEXT
+            );
+            CREATE TABLE IF NOT EXISTS clusters (
+                id          TEXT PRIMARY KEY,
+                label       TEXT,
+                created_at  TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cluster_articles (
+                cluster_id  TEXT REFERENCES clusters(id) ON DELETE CASCADE,
+                article_id  TEXT REFERENCES articles(id) ON DELETE CASCADE,
+                PRIMARY KEY (cluster_id, article_id)
+            );
+        """)
 
-        CREATE TABLE IF NOT EXISTS cluster_articles (
-            cluster_id  TEXT REFERENCES clusters(id),
-            article_id  TEXT REFERENCES articles(id),
-            PRIMARY KEY (cluster_id, article_id)
-        );
-    """)
     conn.commit()
+    cur.close()
     conn.close()
-    log.info("DB ready at %s", DB_PATH)
+    log.info("DB ready")
 
 
-def url_hash(url: str) -> str:
+def url_hash(url):
     return hashlib.sha1(url.encode()).hexdigest()[:16]
 
 
-def article_exists(conn, url: str) -> bool:
-    row = conn.execute("SELECT 1 FROM articles WHERE url = ?", (url,)).fetchone()
-    return row is not None
+def article_exists(cur, url):
+    cur.execute("SELECT 1 FROM articles WHERE url = ?", (url,)) if USE_SQLITE else \
+    cur.execute("SELECT 1 FROM articles WHERE url = %s", (url,))
+    return cur.fetchone() is not None
 
 
-def save_article(conn, article: dict):
-    conn.execute("""
-        INSERT OR IGNORE INTO articles
-            (id, url, title, summary, body, source, published, fetched_at)
-        VALUES
-            (:id, :url, :title, :summary, :body, :source, :published, :fetched_at)
-    """, article)
+def save_article(cur, article):
+    vals = (
+        article["id"], article["url"], article["title"], article["summary"],
+        article["body"], article["source"], article["published"], article["fetched_at"],
+    )
+    if USE_SQLITE:
+        cur.execute("""
+            INSERT OR IGNORE INTO articles
+                (id, url, title, summary, body, source, published, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, vals)
+    else:
+        cur.execute("""
+            INSERT INTO articles (id, url, title, summary, body, source, published, fetched_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO NOTHING
+        """, vals)
 
 
-# ── Feed parsing ──────────────────────────────────────────────────────────────
-
-def parse_date(entry) -> str:
-    """Try every date field feedparser knows about; fall back to now."""
+def parse_date(entry):
     for attr in ("published_parsed", "updated_parsed"):
         val = getattr(entry, attr, None)
         if val:
@@ -97,7 +139,7 @@ def parse_date(entry) -> str:
                 return datetime(*val[:6], tzinfo=timezone.utc).isoformat()
             except Exception:
                 pass
-    for raw_attr in ("published", "updated", "dc_date"):
+    for raw_attr in ("published", "updated"):
         raw = getattr(entry, raw_attr, None)
         if raw:
             try:
@@ -107,25 +149,17 @@ def parse_date(entry) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def get_summary(entry) -> str:
-    """Different feeds use different fields for the summary/description."""
+def get_summary(entry):
     for attr in ("summary", "description", "content"):
         val = getattr(entry, attr, None)
         if val:
             if isinstance(val, list):
                 val = val[0].get("value", "")
-            # Strip HTML tags
             return BeautifulSoup(val, "html.parser").get_text(separator=" ").strip()
     return ""
 
 
-# ── Full-text extraction ──────────────────────────────────────────────────────
-
-def fetch_body(url: str) -> str:
-    """
-    Try trafilatura first (best at extracting main content),
-    fall back to a BeautifulSoup heuristic, then give up gracefully.
-    """
+def fetch_body(url):
     try:
         import trafilatura
         resp = requests.get(url, headers=HEADERS, timeout=10)
@@ -140,15 +174,12 @@ def fetch_body(url: str) -> str:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        # Remove clutter
-        for tag in soup(["script", "style", "nav", "footer", "aside", "header"]):
+        for tag in soup(["script", "style", "nav", "footer", "aside"]):
             tag.decompose()
-        # Prefer article/main elements
-        for selector in ["article", "main", "[role='main']", ".article-body", ".story-body"]:
+        for selector in ["article", "main", ".article-body"]:
             block = soup.select_one(selector)
             if block:
                 return block.get_text(separator=" ").strip()
-        # Last resort: all <p> tags
         paras = [p.get_text() for p in soup.find_all("p") if len(p.get_text()) > 60]
         return " ".join(paras[:20]).strip()
     except Exception as e:
@@ -156,11 +187,10 @@ def fetch_body(url: str) -> str:
         return ""
 
 
-# ── Main ingestion loop ───────────────────────────────────────────────────────
-
 def ingest():
     init_db()
     conn = get_connection()
+    cur  = conn.cursor()
     new_count = 0
 
     for feed_meta in FEEDS:
@@ -175,16 +205,15 @@ def ingest():
             url = getattr(entry, "link", None)
             if not url:
                 continue
-            if article_exists(conn, url):
+            if article_exists(cur, url):
                 log.debug("Skip (already stored): %s", url)
                 continue
 
             title   = getattr(entry, "title", "").strip()
             summary = get_summary(entry)
             pub     = parse_date(entry)
-
             log.info("Fetching body: %s", title[:60])
-            body = fetch_body(url)
+            body    = fetch_body(url)
 
             article = {
                 "id":         url_hash(url),
@@ -196,10 +225,11 @@ def ingest():
                 "published":  pub,
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
-            save_article(conn, article)
+            save_article(cur, article)
             new_count += 1
 
     conn.commit()
+    cur.close()
     conn.close()
     log.info("Ingestion complete — %d new articles stored.", new_count)
     return new_count

@@ -1,51 +1,49 @@
 """
 News Pulse — Topic Clustering
-Loads articles from SQLite, computes TF-IDF vectors, groups similar articles
-via cosine-similarity thresholding, and writes clusters back to the DB.
+TF-IDF + cosine similarity + Union-Find grouping.
 
-Why TF-IDF over keyword overlap?
-  Keyword overlap is order-insensitive and ignores term frequency.
-  TF-IDF naturally up-weights rare distinguishing words (e.g. "Gaza", "Fed rate")
-  and down-weights common ones ("said", "year"). Cosine similarity on TF-IDF vectors
-  then gives a principled similarity score in [0,1].
-
-Limitation: Short headlines produce sparse, unreliable vectors. We mitigate this
-  by concatenating title + summary + first 300 chars of body before vectorising.
+Local dev  → SQLite  (set USE_SQLITE=true in .env)
+Production → Postgres/Neon (DATABASE_URL in environment)
 """
 
-import sqlite3
-import uuid
-import logging
 import os
+import uuid
+import sqlite3
+import logging
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+load_dotenv()
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-DB_PATH  = os.getenv("DB_PATH", "news_pulse.db")
-SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.20"))   # articles ≥ this cosine score share a cluster
-MIN_CLUSTER   = int(os.getenv("MIN_CLUSTER", "2"))          # singletons are dropped
+USE_SQLITE    = os.getenv("USE_SQLITE", "false").lower() == "true"
+DB_PATH       = os.getenv("DB_PATH", "news_pulse.db")
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.20"))
+MIN_CLUSTER   = int(os.getenv("MIN_CLUSTER", "2"))
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if USE_SQLITE:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    else:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        return psycopg2.connect(os.getenv("DATABASE_URL"), cursor_factory=RealDictCursor)
 
 
-def load_articles(conn):
-    rows = conn.execute(
-        "SELECT id, title, summary, body, source, published FROM articles"
-    ).fetchall()
-    return [dict(r) for r in rows]
+def load_articles(cur):
+    cur.execute("SELECT id, title, summary, body, source, published FROM articles")
+    return [dict(r) for r in cur.fetchall()]
 
 
 def build_corpus(articles):
-    """Concatenate title + summary + truncated body for vectorisation."""
     texts = []
     for a in articles:
         title   = a.get("title")   or ""
@@ -56,34 +54,22 @@ def build_corpus(articles):
 
 
 def cluster_articles(articles):
-    """
-    1. Vectorise with TF-IDF (English stop words removed, bigrams included).
-    2. Compute full pairwise cosine similarity matrix.
-    3. Union-Find to group articles sharing sim ≥ SIM_THRESHOLD.
-    Returns list of clusters: [{"label": str, "article_ids": [str]}]
-    """
     if not articles:
         return []
 
     corpus = build_corpus(articles)
-
     vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2),
-        max_df=0.9,          # ignore terms in >90 % of docs (too common)
-        min_df=2,            # ignore terms in only 1 doc (too rare / typos)
-        sublinear_tf=True,   # log-scale TF to reduce impact of very frequent terms
+        stop_words="english", ngram_range=(1, 2),
+        max_df=0.9, min_df=2, sublinear_tf=True,
     )
     try:
         tfidf = vectorizer.fit_transform(corpus)
     except ValueError:
-        log.warning("TF-IDF fit failed (too few docs?), returning no clusters.")
+        log.warning("TF-IDF fit failed — too few docs")
         return []
 
     sim = cosine_similarity(tfidf)
-
-    # ── Union-Find ────────────────────────────────────────────────────────────
-    n = len(articles)
+    n   = len(articles)
     parent = list(range(n))
 
     def find(x):
@@ -102,69 +88,80 @@ def cluster_articles(articles):
             if sim[i, j] >= SIM_THRESHOLD:
                 union(i, j)
 
-    # ── Collect groups ────────────────────────────────────────────────────────
-    groups: dict[int, list[int]] = {}
+    groups = {}
     for idx in range(n):
-        root = find(idx)
-        groups.setdefault(root, []).append(idx)
+        groups.setdefault(find(idx), []).append(idx)
 
-    # ── Generate labels from top TF-IDF terms ────────────────────────────────
     feature_names = vectorizer.get_feature_names_out()
     clusters = []
 
     for root, indices in groups.items():
         if len(indices) < MIN_CLUSTER:
-            continue                          # skip singletons / pairs below threshold
-
-        # Sum TF-IDF scores within the cluster, pick top 3 terms as label
+            continue
         cluster_matrix = tfidf[indices]
         mean_vec = np.asarray(cluster_matrix.mean(axis=0)).flatten()
         top_idx  = mean_vec.argsort()[::-1][:3]
         label    = " · ".join(feature_names[i] for i in top_idx)
-
         clusters.append({
             "label":       label.title(),
             "article_ids": [articles[i]["id"] for i in indices],
         })
 
-    log.info("Formed %d clusters from %d articles (threshold=%.2f)",
-             len(clusters), n, SIM_THRESHOLD)
+    log.info("Formed %d clusters from %d articles", len(clusters), n)
     return clusters
 
 
-def save_clusters(conn, clusters, articles_by_id):
-    # Wipe old clusters on each run (fresh re-clustering)
-    conn.execute("DELETE FROM cluster_articles")
-    conn.execute("DELETE FROM clusters")
+def save_clusters(cur, clusters):
+    if USE_SQLITE:
+        cur.execute("DELETE FROM cluster_articles")
+        cur.execute("DELETE FROM clusters")
+    else:
+        cur.execute("DELETE FROM cluster_articles")
+        cur.execute("DELETE FROM clusters")
 
     now = datetime.now(timezone.utc).isoformat()
+
     for c in clusters:
         cid = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO clusters (id, label, created_at) VALUES (?, ?, ?)",
-            (cid, c["label"], now),
-        )
-        for aid in c["article_ids"]:
-            conn.execute(
-                "INSERT INTO cluster_articles (cluster_id, article_id) VALUES (?, ?)",
-                (cid, aid),
+        if USE_SQLITE:
+            cur.execute(
+                "INSERT INTO clusters (id, label, created_at) VALUES (?, ?, ?)",
+                (cid, c["label"], now),
             )
+            for aid in c["article_ids"]:
+                cur.execute(
+                    "INSERT INTO cluster_articles (cluster_id, article_id) VALUES (?, ?)",
+                    (cid, aid),
+                )
+        else:
+            cur.execute(
+                "INSERT INTO clusters (id, label, created_at) VALUES (%s, %s, %s)",
+                (cid, c["label"], now),
+            )
+            for aid in c["article_ids"]:
+                cur.execute(
+                    "INSERT INTO cluster_articles (cluster_id, article_id) VALUES (%s, %s)",
+                    (cid, aid),
+                )
 
-    conn.commit()
-    log.info("Saved %d clusters to DB.", len(clusters))
+    log.info("Saved %d clusters", len(clusters))
 
 
 def run_clustering():
     conn = get_connection()
-    articles = load_articles(conn)
+    cur  = conn.cursor()
+    articles = load_articles(cur)
+
     if not articles:
-        log.warning("No articles found — run scraper.py first.")
+        log.warning("No articles — run scraper first")
+        cur.close()
         conn.close()
         return
 
-    articles_by_id = {a["id"]: a for a in articles}
     clusters = cluster_articles(articles)
-    save_clusters(conn, clusters, articles_by_id)
+    save_clusters(cur, clusters)
+    conn.commit()
+    cur.close()
     conn.close()
 
 
