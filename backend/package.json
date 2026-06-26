@@ -1,0 +1,17 @@
+{
+  "name": "news-pulse-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev":   "node --watch src/app.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "cors":           "^2.8.5",
+    "express":        "^4.19.2",
+    "helmet":         "^7.1.0",
+    "morgan":         "^1.10.0"
+  }
+}
