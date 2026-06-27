@@ -1,7 +1,4 @@
 // News Pulse — Node.js / Express Backend
-// Serves cluster + article data to the Next.js frontend
-// and triggers the Python pipeline via subprocess.
-
 import express from "express";
 import cors    from "cors";
 import helmet  from "helmet";
@@ -13,13 +10,11 @@ import { ingestRouter    } from "./routes/ingest.js";
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 app.use(morgan("dev"));
 app.use(express.json());
 
-// ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/clusters", clusterRouter);
 app.use("/timeline", timelineRouter);
 app.use("/ingest",   ingestRouter);
@@ -27,10 +22,17 @@ app.use("/ingest",   ingestRouter);
 // Health check
 app.get("/health", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
-// 404 handler
-app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+// Temporary debug route — shows first 50 chars of DATABASE_URL so we can verify it's correct
+app.get("/debug/env", (_req, res) => {
+  const raw = process.env.DATABASE_URL || "NOT SET";
+  res.json({
+    db_url_preview: raw.slice(0, 60),
+    db_url_length: raw.length,
+    starts_with_quote: raw.startsWith('"') || raw.startsWith("'"),
+  });
+});
 
-// Global error handler
+app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 app.use((err, _req, res, _next) => {
   console.error(err);
   res.status(500).json({ error: "Internal server error", detail: err.message });
